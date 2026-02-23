@@ -38,8 +38,8 @@ pinn:
   Ni: 800
   Nb: 400
 
-  # network — uniform hidden layers for Wang Modified MLP skip connections
-  hidden_layers: [64, 64, 64, 64]
+  # network (paper: [80, 40, 20, 10])
+  hidden_layers: [80, 40, 20, 10]
   activation: tanh
   output_transform: tanh_bound  # tanh_bound | none
 
@@ -53,9 +53,8 @@ pinn:
     trainable: true      # let the network tune the frequencies
 
   # loss weights λ = [Lr, Lrx, Lrt, Lic, Liv, Lbl, Lbr]
-  # Baseline: equal weights; gradient balancing (Wang et al. 2021) adjusts
-  # them dynamically during the Adam phase.
-  lambda: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # Paper's weights: λ_iv=100 to address phase problem (time-shift symmetry).
+  lambda: [100.0, 100.0, 100.0, 1.0, 100.0, 1.0, 1.0]
 
   # Causal training (Wang et al., 2022 — arXiv:2203.07404)
   # Disabled for now. Was essentially inactive in previous run (w_min=0.9996).
@@ -66,10 +65,10 @@ pinn:
     n_slices: 20     # number of temporal bins
 
   # Gradient balancing (Wang, Teng & Perdikaris 2021)
-  # Dynamically adjusts loss weights so per-term gradient magnitudes match.
-  # Active during Adam phase only; weights are frozen for L-BFGS.
+  # Disabled: previous runs showed it deflates λ_iv, worsening the phase problem.
+  # Using paper's fixed weights instead.
   gradient_balancing:
-    enabled: true
+    enabled: false
     period: 100      # recompute weights every N Adam steps
     alpha: 0.9       # EMA decay (higher = slower adaptation)
 

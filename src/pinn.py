@@ -25,18 +25,166 @@ import torch
 
 from .potentials import V_of_x_torch
 from .initial_data import gaussian_phi, gaussian_phi_t
-from .modified_mlp import ModifiedMLP
+from .modified_mlp import PlainRFFNet
+
+
+# ---------------------------------------------------------------------------
+# Causal training (Wang, Perdikaris & Sifakis 2022, arXiv:2203.07404)
+# ---------------------------------------------------------------------------
+
+class CausalWeighter:
+    """Apply causal weighting to PDE residuals (Wang et al. 2022).
+
+    Divides the time domain into slices and weights residuals so that
+    later times are penalised unless earlier times are already well-resolved.
+
+        w_k = exp(-epsilon * sum_{j<k} L_j)
+
+    where L_j is the mean squared PDE residual in time slice j.
+
+    Light-cone masking (Patel et al. 2024): when computing L_j, only
+    points inside the past light cone of the initial data are included.
+    This prevents causally-empty regions (where psi=0 trivially) from
+    diluting the per-slice loss estimate.  c=1 in tortoise coordinates,
+    so the light cone is |x* - x0| <= t + 3*sigma.
+
+    Residuals are multiplied by sqrt(w_k) so that MSE(sqrt(w)*r) = w*r**2,
+    giving the causally weighted loss without modifying DeepXDE's loss
+    pipeline.  The weights are detached so gradients flow only through the
+    residuals, not through the weights themselves.
+    """
+
+    def __init__(
+        self,
+        tmin: float,
+        tmax: float,
+        epsilon: float = 10.0,
+        num_slices: int = 20,
+        x0: float = 0.0,
+        sigma: float = 5.0,
+    ):
+        self.tmin = tmin
+        self.tmax = tmax
+        self.num_slices = num_slices
+        self.epsilon = epsilon
+        self.w_min = 1.0  # min causal weight (approaches 1 as training converges)
+
+        # Light-cone parameters: signal from Gaussian at x0 with width sigma
+        # reaches x* when |x* - x0| <= t + 3*sigma  (c=1 in tortoise coords)
+        self.x0 = x0
+        self.sigma = sigma
+
+    def apply(self, x: torch.Tensor, *residuals: torch.Tensor) -> list:
+        """Weight residuals by causal factor.
+
+        Parameters
+        ----------
+        x : Tensor (N, 2)
+            Input coordinates [x*, t].
+        *residuals : Tensor (N, 1) each
+            PDE residual components [r, r_x, r_t].
+
+        Returns
+        -------
+        list of Tensor
+            Weighted residuals, same shapes as inputs.
+        """
+        xs = x[:, 0:1].detach()  # (N, 1)
+        t = x[:, 1:2].detach()   # (N, 1)
+
+        # Assign each point to a time slice
+        dt = (self.tmax - self.tmin) / self.num_slices
+        slice_idx = ((t - self.tmin) / dt).long().clamp(
+            0, self.num_slices - 1
+        ).squeeze(-1)  # (N,)
+
+        # Light-cone mask: point is causally active if |x* - x0| <= t + 3*sigma
+        in_light_cone = (torch.abs(xs - self.x0) <= t + 3.0 * self.sigma).squeeze(-1)  # (N,)
+
+        # Per-slice mean squared PDE residual (primary residual only)
+        # Only include causally-active points to avoid dilution
+        r_det = residuals[0].detach()  # (N, 1)
+        per_slice_loss = torch.zeros(
+            self.num_slices, device=r_det.device, dtype=r_det.dtype
+        )
+        for k in range(self.num_slices):
+            mask = (slice_idx == k) & in_light_cone
+            if mask.any():
+                vals = r_det[mask] ** 2
+                vals = torch.nan_to_num(vals, nan=0.0)
+                per_slice_loss[k] = vals.mean()
+
+        # Causal weights: w_k = exp(-epsilon * sum_{j<k} L_j)
+        # w_0 = 1 (no prior losses), w_1 = exp(-eps*L_0), ...
+        cumulative = torch.cumsum(per_slice_loss, dim=0)
+        shifted = torch.cat(
+            [torch.zeros(1, device=r_det.device, dtype=r_det.dtype),
+             cumulative[:-1]]
+        )
+        w = torch.exp(-self.epsilon * shifted)
+
+        # Track minimum weight for monitoring convergence
+        self.w_min = w.min().item()
+
+        # Map slice weights back to individual points
+        # (weights apply to ALL points, including outside light cone)
+        sqrt_w = torch.sqrt(w[slice_idx]).unsqueeze(1)  # (N, 1), detached
+
+        return [res * sqrt_w for res in residuals]
+
+
+class CausalTrainingMonitor(dde.callbacks.Callback):
+    """Log the minimum causal weight for monitoring convergence."""
+
+    def __init__(self, causal_weighter: CausalWeighter, period: int = 100):
+        super().__init__()
+        self.cw = causal_weighter
+        self.period = period
+
+    def on_epoch_end(self):
+        step = self.model.train_state.step
+        if step % self.period != 0:
+            return
+
+        print(f"  [Causal] step {step}: epsilon={self.cw.epsilon}, w_min={self.cw.w_min:.6f}")
 
 
 # ---------------------------------------------------------------------------
 # PDE residual
 # ---------------------------------------------------------------------------
 
-def _make_pde_func(cfg: Dict):
-    """Build the PDE residual function, closed over physics parameters."""
+def _make_pde_func(cfg: Dict, tmax_override: Optional[float] = None):
+    """Build the PDE residual function, closed over physics parameters.
+
+    If causal training is enabled in the config, residuals are weighted by
+    time-slice-dependent causal factors (Wang et al. 2022).
+    """
     M = float(cfg["physics"]["M"])
     l = int(cfg["physics"]["l"])
     potential = cfg["physics"]["potential"]
+
+    # --- optional causal weighting ---
+    causal_cfg = cfg["pinn"].get("causal", {})
+    causal_weighter = None
+    if causal_cfg.get("enabled", False):
+        tmin = float(cfg["domain"]["tmin"])
+        tmax = tmax_override if tmax_override is not None else float(cfg["domain"]["tmax"])
+
+        # Light-cone parameters from initial data
+        x0_ic = float(cfg["initial_data"]["x0"])
+        sigma_ic = float(cfg["initial_data"]["sigma"])
+
+        causal_weighter = CausalWeighter(
+            tmin=tmin,
+            tmax=tmax,
+            epsilon=float(causal_cfg.get("epsilon", 10.0)),
+            num_slices=int(causal_cfg.get("n_slices", 20)),
+            x0=x0_ic,
+            sigma=sigma_ic,
+        )
+        print(f"[PINN] Causal training enabled: epsilon={causal_weighter.epsilon}, "
+              f"n_slices={causal_weighter.num_slices}, t=[{tmin},{tmax}], "
+              f"light-cone: x0={x0_ic}, sigma={sigma_ic}")
 
     def pde(x, y):
         """
@@ -70,8 +218,14 @@ def _make_pde_func(cfg: Dict):
         r_x = dr[:, 0:1]
         r_t = dr[:, 1:2]
 
+        # Apply causal weighting if enabled
+        if causal_weighter is not None:
+            r, r_x, r_t = causal_weighter.apply(x, r, r_x, r_t)
+
         return [r, r_x, r_t]
 
+    # Attach the causal weighter so callers can access it (e.g. for monitoring)
+    pde._causal_weighter = causal_weighter
     return pde
 
 
@@ -143,13 +297,18 @@ def _make_ic_bcs(cfg: Dict, geomtime):
 # ---------------------------------------------------------------------------
 
 class GradientBalancing(dde.callbacks.Callback):
-    """Dynamically adjust loss weights so per-term gradient magnitudes match.
+    """Dynamically adjust loss weights via Wang, Teng & Perdikaris 2021, Alg. 1.
 
     At every *period* Adam steps the callback:
       1. computes each unweighted loss L_i,
-      2. backpropagates each independently to obtain max|dL_i/dtheta|,
-      3. sets  w_i = <max_grad> / max_grad_i   (mean-normalised),
+      2. backpropagates each independently,
+      3. sets  λ̂_i = max_θ|∇L_r| / mean_θ|∇L_i|  (Alg. 1),
+         where L_r (index 0) is the primary PDE residual,
       4. applies an exponential moving average with decay *alpha*.
+
+    The PDE residual (index 0) always keeps weight 1.0 — it is the
+    reference anchor.  All other terms (gradient-enhanced PDE residuals,
+    IC, BC) are reweighted relative to it.
 
     The weights are frozen during L-BFGS (callback only fires in SGD loops).
     """
@@ -177,22 +336,35 @@ class GradientBalancing(dde.callbacks.Callback):
             self.model.train_state.train_aux_vars,
         )
 
-        # --- per-term max|grad| ---
+        # --- per-term gradient statistics ---
+        # max|grad|  : needed for the reference term (L_r, index 0)
+        # mean|grad| : needed for the denominator of all other terms
         max_grads: List[float] = []
+        mean_grads: List[float] = []
         for i, loss_i in enumerate(losses):
             net.zero_grad()
             loss_i.backward(retain_graph=(i < n - 1))
             mg = 0.0
+            total_abs = 0.0
+            count = 0
             for p in net.parameters():
                 if p.grad is not None:
                     mg = max(mg, p.grad.abs().max().item())
-            max_grads.append(mg + 1e-16)  # avoid division by zero
+                    total_abs += p.grad.abs().sum().item()
+                    count += p.grad.numel()
+            max_grads.append(mg + 1e-16)
+            mean_grads.append(total_abs / max(count, 1) + 1e-16)
 
         net.zero_grad()
 
-        # --- compute balanced weights ---
-        mean_mg = sum(max_grads) / n
-        raw = [mean_mg / mg for mg in max_grads]
+        # --- compute balanced weights (Algorithm 1) ---
+        # Reference: max|∇_θ L_r| where L_r is the primary PDE residual (index 0).
+        # Weight_i = max|∇L_r| / mean|∇L_i|  for i >= 1.
+        # Weight_0 = 1.0 (PDE residual is the anchor).
+        max_grad_r = max_grads[0]
+        raw = [1.0]  # L_r weight
+        for i in range(1, n):
+            raw.append(max_grad_r / mean_grads[i])
 
         if self._ema_weights is None:
             self._ema_weights = raw
@@ -218,7 +390,7 @@ class GradientBalancing(dde.callbacks.Callback):
 def build_model(cfg: Dict, tmax_override: Optional[float] = None, net_override: Optional[torch.nn.Module] = None) -> Tuple[dde.Model, dde.data.TimePDE]:
     """Construct the DeepXDE Model from the experiment config.
 
-    Uses the Modified MLP with Trainable Random Fourier Features (RFF)
+    Uses PlainRFFNet (plain MLP + Trainable RFF input embedding)
     instead of a standard FNN, to overcome spectral bias.
     """
     xmin = float(cfg["domain"]["xmin"])
@@ -230,7 +402,8 @@ def build_model(cfg: Dict, tmax_override: Optional[float] = None, net_override: 
     timedomain = dde.geometry.TimeDomain(tmin, tmax)
     geomtime = dde.geometry.GeometryXTime(geom, timedomain)
 
-    pde_func = _make_pde_func(cfg)
+    tmax_actual = tmax_override if tmax_override is not None else float(cfg["domain"]["tmax"])
+    pde_func = _make_pde_func(cfg, tmax_override=tmax_actual)
     ic_bcs = _make_ic_bcs(cfg, geomtime)
 
     # Scale the number of points by the time domain fraction
@@ -251,6 +424,16 @@ def build_model(cfg: Dict, tmax_override: Optional[float] = None, net_override: 
 
     if net_override is not None:
         net = net_override
+        # Update input normalization for the new time window (curriculum)
+        x_lo, x_hi = xmin, xmax
+        t_lo, t_hi = tmin, tmax
+
+        def _input_normalize_update(x, _xlo=x_lo, _xhi=x_hi, _tlo=t_lo, _thi=t_hi):
+            x_n = 2.0 * (x[:, 0:1] - _xlo) / (_xhi - _xlo) - 1.0
+            t_n = 2.0 * (x[:, 1:2] - _tlo) / (_thi - _tlo) - 1.0
+            return torch.cat([x_n, t_n], dim=1)
+
+        net.apply_feature_transform(_input_normalize_update)
     else:
         # --- Modified MLP with Trainable RFF ---
         hidden = [int(w) for w in cfg["pinn"]["hidden_layers"]]
@@ -260,7 +443,7 @@ def build_model(cfg: Dict, tmax_override: Optional[float] = None, net_override: 
         rff_trainable = bool(rff_cfg.get("trainable", True))
         activation = cfg["pinn"].get("activation", "tanh")
 
-        net = ModifiedMLP(
+        net = PlainRFFNet(
             hidden_layers=hidden,
             num_rff=num_rff,
             rff_sigma=rff_sigma,
@@ -268,9 +451,26 @@ def build_model(cfg: Dict, tmax_override: Optional[float] = None, net_override: 
             activation=activation,
         )
 
-        print(f"[PINN] ModifiedMLP: hidden={hidden}, "
-              f"RFF(num={num_rff}, σ={rff_sigma}, trainable={rff_trainable})")
+        print(f"[PINN] PlainRFFNet: hidden={hidden}, "
+              f"RFF(num={num_rff}, sigma={rff_sigma}, trainable={rff_trainable})")
         print(f"[PINN] Trainable parameters: {net.num_trainable_parameters()}")
+
+        # Input normalization: map physical domain → [-1, 1]²
+        # Ensures the RFF embedding sees O(1) inputs so that rff.sigma
+        # controls frequency resolution as intended (Wang et al. 2023).
+        # Autograd traces through this, so PDE derivatives remain in
+        # physical coordinates — no manual chain-rule correction needed.
+        x_lo, x_hi = xmin, xmax
+        t_lo, t_hi = tmin, tmax   # uses tmax_override for curriculum windows
+
+        def _input_normalize(x, _xlo=x_lo, _xhi=x_hi, _tlo=t_lo, _thi=t_hi):
+            x_n = 2.0 * (x[:, 0:1] - _xlo) / (_xhi - _xlo) - 1.0
+            t_n = 2.0 * (x[:, 1:2] - _tlo) / (_thi - _tlo) - 1.0
+            return torch.cat([x_n, t_n], dim=1)
+
+        net.apply_feature_transform(_input_normalize)
+        print(f"[PINN] Input normalization: x*∈[{x_lo},{x_hi}]→[-1,1], "
+              f"t∈[{t_lo},{t_hi}]→[-1,1]")
 
         # Output transform: A * tanh(y)
         # Bounding the output enforces the physical constraint of energy conservation
@@ -279,6 +479,10 @@ def build_model(cfg: Dict, tmax_override: Optional[float] = None, net_override: 
         net.apply_output_transform(lambda x, y: A_bound * torch.tanh(y))
 
     model = dde.Model(data, net)
+
+    # Expose causal weighter on model for callback/monitoring access
+    model._causal_weighter = getattr(pde_func, '_causal_weighter', None)
+
     return model, data
 
 
@@ -327,13 +531,17 @@ def _train_pinn_curriculum(
             model_save_path = os.path.join(window_ckpt_dir, "model")
             
         # Check if this window is already fully trained
+        # DeepXDE appends the step number: model-final-{step}.pt
         if resume and window_ckpt_dir:
-            final_ckpt = os.path.join(window_ckpt_dir, "model-final.pt")
-            if os.path.exists(final_ckpt):
+            final_ckpt = _find_final_checkpoint(window_ckpt_dir)
+            if final_ckpt is not None:
                 print(f"[CKPT] Window {i+1} already completed. Restoring and skipping.")
-                model.compile("adam", lr=1e-3) # dummy compile
-                model.train(iterations=0, display_every=1) # init train state
-                model.restore(final_ckpt, verbose=1)
+                model.compile("adam", lr=1e-3)  # dummy compile
+                model.train(iterations=0, display_every=1)  # init train state
+                # Only restore model weights (skip optimizer state to avoid mismatch)
+                checkpoint = torch.load(final_ckpt, weights_only=True)
+                model.net.load_state_dict(checkpoint["model_state_dict"])
+                print(f"  Restored weights from {final_ckpt}")
                 continue
             
         # ---- Adam phase ----
@@ -354,6 +562,12 @@ def _train_pinn_curriculum(
             gb_alpha = float(grad_bal_cfg.get("alpha", 0.9))
             callbacks_adam.append(
                 GradientBalancing(period=gb_period, alpha=gb_alpha)
+            )
+
+        # Causal training monitor
+        if model._causal_weighter is not None:
+            callbacks_adam.append(
+                CausalTrainingMonitor(model._causal_weighter, period=100)
             )
 
         model_restore_path = None
@@ -429,6 +643,12 @@ def _train_pinn_curriculum(
         if lbfgs_resample_period > 0:
             callbacks_lbfgs.append(
                 dde.callbacks.PDEPointResampler(period=lbfgs_resample_period)
+            )
+
+        # Causal training monitor for L-BFGS (curriculum)
+        if model._causal_weighter is not None:
+            callbacks_lbfgs.append(
+                CausalTrainingMonitor(model._causal_weighter, period=100)
             )
             
         losshistory_lbfgs, _ = model.train(
@@ -557,6 +777,12 @@ def train_pinn(
             print(f"[PINN] Gradient balancing enabled "
                   f"(period={gb_period}, alpha={gb_alpha})")
 
+        # Causal training monitor
+        if model._causal_weighter is not None:
+            callbacks_adam.append(
+                CausalTrainingMonitor(model._causal_weighter, period=100)
+            )
+
         if model_save_path:
             callbacks_adam.append(
                 dde.callbacks.ModelCheckpoint(
@@ -673,6 +899,12 @@ def train_pinn(
         )
         print(f"[PINN] L-BFGS: resampling collocation points every {lbfgs_resample_period} iterations")
 
+    # Causal training monitor for L-BFGS
+    if model._causal_weighter is not None:
+        callbacks_lbfgs.append(
+            CausalTrainingMonitor(model._causal_weighter, period=100)
+        )
+
     losshistory_lbfgs, _ = model.train(
         iterations=iters_remaining,
         callbacks=callbacks_lbfgs,
@@ -734,6 +966,20 @@ def _find_adam_done_checkpoint(checkpoint_dir: str) -> Optional[str]:
         return None
     for f in os.listdir(checkpoint_dir):
         if f.startswith("model-adam_done") and f.endswith(".pt"):
+            return os.path.join(checkpoint_dir, f)
+    return None
+
+
+def _find_final_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """Find the model-final-*.pt checkpoint if it exists.
+
+    DeepXDE appends the step number, so the file is model-final-{step}.pt.
+    Returns the full path or None.
+    """
+    if not os.path.isdir(checkpoint_dir):
+        return None
+    for f in os.listdir(checkpoint_dir):
+        if f.startswith("model-final") and f.endswith(".pt"):
             return os.path.join(checkpoint_dir, f)
     return None
 
