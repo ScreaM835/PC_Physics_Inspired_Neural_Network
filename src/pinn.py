@@ -38,9 +38,14 @@ class CausalWeighter:
     Divides the time domain into slices and weights residuals so that
     later times are penalised unless earlier times are already well-resolved.
 
-        w_k = exp(-epsilon * sum_{j<k} L_j)
+        w_k = exp(-epsilon * sum_{j<k} L̂_j)
 
-    where L_j is the mean squared PDE residual in time slice j.
+    where L̂_j = L_j / max_k(L_k) is the *rescaled* mean squared PDE
+    residual in time slice j.  Normalising by the max slice loss ensures
+    that L̂ ∈ [0, 1] regardless of absolute loss magnitude, so epsilon
+    controls causal strength as Wang et al. intended (their derivation
+    assumes O(1) losses).  Without rescaling, gradient-enhanced training
+    drives per-slice losses to O(10^-4), making epsilon=10 a no-op.
 
     Light-cone masking (Patel et al. 2024): when computing L_j, only
     points inside the past light cone of the initial data are included.
@@ -67,6 +72,7 @@ class CausalWeighter:
         self.tmax = tmax
         self.num_slices = num_slices
         self.epsilon = epsilon
+        self.active = True   # disabled before L-BFGS (Adam-only mechanism)
         self.w_min = 1.0  # min causal weight (approaches 1 as training converges)
 
         # Light-cone parameters: signal from Gaussian at x0 with width sigma
@@ -89,6 +95,11 @@ class CausalWeighter:
         list of Tensor
             Weighted residuals, same shapes as inputs.
         """
+        # Passthrough when disabled (L-BFGS phase)
+        if not self.active:
+            self.w_min = 1.0
+            return list(residuals)
+
         xs = x[:, 0:1].detach()  # (N, 1)
         t = x[:, 1:2].detach()   # (N, 1)
 
@@ -113,6 +124,12 @@ class CausalWeighter:
                 vals = r_det[mask] ** 2
                 vals = torch.nan_to_num(vals, nan=0.0)
                 per_slice_loss[k] = vals.mean()
+
+        # Rescale per-slice losses to O(1) so that epsilon controls the
+        # causal strength independent of absolute loss magnitude.
+        # Without this, losses of O(10^-4) make epsilon=10 a no-op.
+        max_loss = per_slice_loss.max().clamp(min=1e-30)
+        per_slice_loss = per_slice_loss / max_loss
 
         # Causal weights: w_k = exp(-epsilon * sum_{j<k} L_j)
         # w_0 = 1 (no prior losses), w_1 = exp(-eps*L_0), ...
@@ -609,7 +626,12 @@ def _train_pinn_curriculum(
         lbfgs_iters = int(lbfgs_cfg["iters"])
 
         lbfgs_loss_weights = list(model.loss_weights)
-        
+
+        # Disable causal weighting for L-BFGS (Adam-only mechanism)
+        if model._causal_weighter is not None:
+            model._causal_weighter.active = False
+            print("[PINN] Causal weighting disabled for L-BFGS phase")
+
         dde.optimizers.set_LBFGS_options(
             maxcor=100,
             maxiter=lbfgs_iters,
@@ -824,6 +846,13 @@ def train_pinn(
     # ---- L-BFGS phase ----
     lbfgs_cfg = cfg["pinn"]["lbfgs"]
     lbfgs_iters = int(lbfgs_cfg["iters"])
+
+    # Disable causal weighting for L-BFGS — Wang et al. designed it for
+    # Adam only.  L-BFGS needs a stationary objective; data-dependent
+    # causal weights that change every forward pass violate this.
+    if model._causal_weighter is not None:
+        model._causal_weighter.active = False
+        print("[PINN] Causal weighting disabled for L-BFGS phase")
 
     # Freeze the gradient-balanced weights from Adam for the L-BFGS phase.
     lbfgs_loss_weights = list(model.loss_weights)
